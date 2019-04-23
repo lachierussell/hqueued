@@ -1,0 +1,12 @@
+# sudo touch /etc/systemd/system/foo-daemon.service
+# sudo chmod 664 /etc/systemd/system/foo-daemon.service
+
+[Unit]
+Description=HQueue
+
+[Service]
+ExecStart=/usr/local/bin/hqueued
+User=ubu-ser
+
+[Install]
+WantedBy=multi-user.target

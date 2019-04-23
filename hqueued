@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+#   put -r /Users/lachlanrussell/Developer/LachlanRussell/WorkingPython/
+
+## Author: Lachlan Russell
+# Version: 0.1
+# Monitor and rescheduling service for a houdini queue server.
+# Designed to be deployed by systemd and integrated with a gmail account for notifications.
+# Keeps track of succeeded jobs to make sure the houdini queue is working as expected.
+# Attempts to cancel hung jobs and continue with remaining renders.
+# FUTURE PLANS: Reschedule failed jobs if not other jobs are waiting.
+
+# ---------- # ---------- # ---------- # ---------- # ---------- # ---------- # ---------- # ---------- # ---------- #
+# Imports - Note many are linux specific.
+
+import systemd.daemon
+import datetime
+import xmlrpc.client as rpc
+from time import sleep
+import logging
+from systemd.journal import JournalHandler
+import yagmail
+import csv
+import json
+
+# ---------- # ---------- # ---------- # ---------- # ---------- # ---------- # ---------- # ---------- # ---------- #
+# Utilities
+
+
+## Attempts to establish a connection with the server using xmlrpc. Returns the server handle on success and None
+# on failure.
+# Sends an email to the receivers to notify them of the connection failure.
+# @address: http:// address to the server
+def connect_to_server(address):
+    try:
+        server = rpc.ServerProxy(address)
+        server.ping()
+        return server
+    except Exception as error:
+        message = str(error) + config["connection_message"]
+        logger.fatal(message)
+        send_email(config["email_recipients"], "Connection Failed", message)
+        return None
+
+
+## Sends an email to the recipients using the yagmail package
+# @recipients: A list of recipients addresses
+# @subject: The subject field as a string
+# @message: The message field as a string
+def send_email(recipients, subject, message):
+    with yagmail.SMTP(config["send_email_address"], config["authentication"]) as yag:
+        yag.send(
+            to=recipients,
+            subject=subject,
+            contents=message,
+        )
+
+
+## Reads in an input file in csv format, splitting on ','. Replaces each string with the integer representation.
+# This file is converted into a set and returned.
+# @file_name: The file to read. Absolute paths are ideal currently.
+def open_and_read_file(file_name):
+    with open(file_name, "r") as input_file:
+        contents = input_file.read().split(',')
+        contents[:] = [int(i) for i in contents]
+    return set(contents)
+
+
+## Overwrites file_name with contents in a csv type format.
+# @file_name: The file to read. Absolute paths are ideal currently.
+# @contents: List (or set) of data to be written to the file.
+def overwrite_data_file(file_name, contents):
+    with open(file_name, 'w') as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(list(contents))
+
+
+def write_json(file, json_object):
+    with open(file, "w") as json_file:
+        json.dump(json_object, json_file)
+
+
+def read_json(file):
+    with open(file, "r") as json_file:
+        json_object = json.load(json_file)
+        return json_object
+
+
+## Attempts to cancel a job on the HQueue Server. Waits 2 minutes before checking for successful cancellation of job.
+# Notifies the recipients via email the success or failure of this task.
+# @server: A HQueue server handle (pre-established connection)
+# @jobs: List of jobs currently running that will be canceled.
+def cancel_job(server, jobs):
+    server.cancelJobs(jobs)
+    sleep(120)  # wait 2 minutes to allow server to cancel and initiate new running job.
+    new_jobs = server.getJobIdsByStatus("running")
+    if jobs == new_jobs:  # if this didn't work...
+        error = "Executing job: " + str(jobs) + " failed. Attempted to terminate but current running job is: " \
+                + str(new_jobs) + ".\n The server will continue to hang until this is fixed by a user."
+        send_email(config["email_recipients"], "Jobs failed to cancel", error)
+    else:
+        error = "Executing job: " + str(jobs) + " failed. Attempted to terminate (success). Current running job is: " \
+                + str(new_jobs)
+        send_email(config["email_recipients"], "Jobs cancel success", error)
+
+
+# ---------- # ---------- # ---------- # ---------- # ---------- # ---------- # ---------- # ---------- # ---------- #
+
+
+if __name__ == '__main__':
+
+    # Set the logger: Runs before main for some reason.
+    logger = logging.getLogger('HQueue')
+    logger.addHandler(JournalHandler())
+    logger.setLevel(logging.INFO)
+    logger.info('Starting up ...')
+
+    last_poll = None
+    config = read_json("/etc/opt/hqueued.conf")
+    half_daily_log = ""
+
+    # Alert systemd the application is ready
+    systemd.daemon.notify('READY=1')
+
+    # # Global variables:
+    # delay_time = 3600  # delay for 60 minutes.
+    # records_file = "/home/ubu-ser/WorkingPython/input_file"
+    # server_address = "http://192.168.0.12:5000"
+    # receivers = ["lachie.russell@gmail.com"]
+
+    # Send half daily report within 5 and 6pm:
+    start_time_evening = datetime.time(17, 0, 0)
+    end_time_evening = datetime.time(18, 0, 0)
+    # and 5 and 6am
+    start_time_morning = datetime.time(5, 0, 0)
+    end_time_morning = datetime.time(6, 0, 0)
+
+    # Enter main loop: This is the daemons usual state.
+    while True:
+
+        this_poll = datetime.datetime.now()
+
+        # connect to the server
+        hq = connect_to_server(config["server_address"])
+        if hq is None:
+            sleep(config["delay_time"])
+            continue
+
+        # read in previous data from the server
+        # completed jobs
+        # request completed jobs from the server
+        data = {"succeeded": set(read_json(config["data_file"])),
+                "current_job": hq.getJobIdsByStatus("running"),
+                "updated": set(hq.getJobIdsByStatus("succeeded"))
+                }
+
+        # check jobs against file
+        if data["succeeded"] == data["updated"]:
+            # No jobs completed, something must be wrong.
+            error_message = "**ERROR** NO" + config["standard_message"]
+            logger.fatal(error_message)
+            send_email(config["email_recipients"], "No jobs completed", error_message)
+            half_daily_log += error_message + ": at " + str(this_poll.time()) + "\n" 
+            cancel_job(hq, data["current_job"])
+        else:
+            # At least one job completed
+            newly_completed_jobs = len(data["updated"] - data["succeeded"])
+            message = str(data["updated"] - data["succeeded"]) + config["standard_message"]
+            logger.info(message)
+            half_daily_log += str(newly_completed_jobs) + " completed at: " + str(this_poll.time()) + "\n"
+
+        # overwrite the data file with the latest records of succeeded jobs
+        # overwrite_data_file(records_file, succeeded_jobs)
+        data["succeeded"] = list(data["succeeded"])
+        data["current_job"] = list(data["current_job"])
+        data["updated"] = list(data["updated"])
+        write_json(config["data_file"], data["updated"])
+
+        # Check if half daily report requires sending.
+        if start_time_evening <= this_poll.time() < end_time_evening or start_time_morning <= this_poll.time() \
+                < end_time_morning:
+            send_email(config["email_recipients"], "Half Daily Report", half_daily_log)
+            half_daily_log = ""  # Flush the log.
+
+        # Update the last poll time
+        last_poll = this_poll
+        # Set the process to sleep until next loop
+        sleep(config["delay_time"])
