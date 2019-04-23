@@ -18,3 +18,8 @@ Running the install.sh script 'should' install the daemon correctly. However it 
 # Use
 
 The daemon should take care of itself now. Although while it is still being tested keep an eye on it. The daemon wont make any attempt to reschedule jobs if they have failed, and if jobs are taking over 1 hour the config file will need to be adjusted. Note that the time is in seconds. 
+
+# Bugs & Suggestions
+
+Please contact me if you discover any bugs, or have any suggestions.
+Known bugs will be posted here before they are fixed.
